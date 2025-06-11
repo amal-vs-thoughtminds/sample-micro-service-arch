@@ -1,0 +1,101 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: postgres_db
+    environment:
+      POSTGRES_DB: microservices_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres123
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - microservices_network
+
+  # MongoDB Database
+  mongodb:
+    image: mongo:7.0
+    container_name: mongodb
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: admin123
+    ports:
+      - "27018:27017"
+    volumes:
+      - mongodb_data:/data/db
+    networks:
+      - microservices_network
+
+  # Analytics Microservice
+  analytics-service:
+    build:
+      context: ./analytics
+      dockerfile: Dockerfile
+    container_name: analytics_service
+    ports:
+      - "8001:8000"
+    environment:
+      - ENV=development
+      - LOG_LEVEL=DEBUG
+      - PRODUCTION=false
+    env_file:
+      - ./analytics/.env
+    depends_on:
+      - postgres
+      - mongodb
+    networks:
+      - microservices_network
+    volumes:
+      - ./analytics:/app
+      - analytics_logs:/app/logs
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --log-level debug
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # User Microservice
+  user-service:
+    build:
+      context: ./user
+      dockerfile: Dockerfile
+    container_name: user_service
+    ports:
+      - "8002:8000"
+    environment:
+      - ENV=development
+      - LOG_LEVEL=DEBUG
+      - PRODUCTION=false
+    env_file:
+      - ./user/.env
+    depends_on:
+      - postgres
+      - mongodb
+    networks:
+      - microservices_network
+    volumes:
+      - ./user:/app
+      - user_logs:/app/logs
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --log-level debug
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  postgres_data:
+  mongodb_data:
+  analytics_logs:
+  user_logs:
+
+networks:
+  microservices_network:
+    driver: bridge 
