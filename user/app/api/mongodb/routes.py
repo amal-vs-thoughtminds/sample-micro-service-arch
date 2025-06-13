@@ -29,7 +29,6 @@ async def create_activity(
 ):
     """Create a new user activity record"""
     try:
-        # Add IP and User Agent from request
         activity_data.ip_address = request.client.host
         activity_data.user_agent = request.headers.get("user-agent")
         

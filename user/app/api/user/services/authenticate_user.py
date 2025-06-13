@@ -5,7 +5,6 @@ from typing import Optional
 
 from ....models.user import User
 
-# Password hashing
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 

@@ -16,7 +16,7 @@ def get_password_hash(password: str) -> str:
 
 async def create_user(db: AsyncSession, user_data: UserCreate) -> User:
     """Create a new user"""
-    # Check if user exists
+
     result = await db.execute(
         select(User).where(
             (User.username == user_data.username) | (User.email == user_data.email)
@@ -27,7 +27,6 @@ async def create_user(db: AsyncSession, user_data: UserCreate) -> User:
     if existing_user:
         raise ValueError("User with this username or email already exists")
     
-    # Create user
     hashed_password = get_password_hash(user_data.password)
     db_user = User(
         username=user_data.username,
