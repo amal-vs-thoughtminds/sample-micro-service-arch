@@ -1,3 +1,5 @@
+version: '3.8'
+
 services:
   # PostgreSQL Database
   postgres:
@@ -13,6 +15,12 @@ services:
       - postgres_data:/var/lib/postgresql/data
     networks:
       - microservices_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
   # MongoDB Database
   mongodb:
@@ -27,12 +35,18 @@ services:
       - mongodb_data:/data/db
     networks:
       - microservices_network
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
   # Analytics Microservice
   analytics-service:
     build:
-      context: ./analytics
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: ./analytics/Dockerfile
     container_name: analytics_service
     ports:
       - "8001:8000"
@@ -40,15 +54,22 @@ services:
       - ENV=development
       - LOG_LEVEL=DEBUG
       - PRODUCTION=false
+      - SERVICE_NAME=analytics-service
+      - SERVICE_URL=http://analytics-service:8000
+      - ANALYTICS_SERVICE_ENCRYPTION_KEY=analytics-service-secret-key-456
+      - USER_SERVICE_ENCRYPTION_KEY=user-service-secret-key-123
     env_file:
       - ./analytics/.env
     depends_on:
-      - postgres
-      - mongodb
+      postgres:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
     networks:
       - microservices_network
     volumes:
       - ./analytics:/app
+      - ./shared:/app/shared
       - analytics_logs:/app/logs
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --log-level debug
     healthcheck:
@@ -61,8 +82,8 @@ services:
   # User Microservice
   user-service:
     build:
-      context: ./user
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: ./user/Dockerfile
     container_name: user_service
     ports:
       - "8002:8000"
@@ -70,15 +91,24 @@ services:
       - ENV=development
       - LOG_LEVEL=DEBUG
       - PRODUCTION=false
+      - SERVICE_NAME=user-service
+      - SERVICE_URL=http://user-service:8000
+      - USER_SERVICE_ENCRYPTION_KEY=user-service-secret-key-123
+      - ANALYTICS_SERVICE_ENCRYPTION_KEY=analytics-service-secret-key-456
     env_file:
       - ./user/.env
     depends_on:
-      - postgres
-      - mongodb
+      postgres:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+      analytics-service:
+        condition: service_healthy
     networks:
       - microservices_network
     volumes:
       - ./user:/app
+      - ./shared:/app/shared
       - user_logs:/app/logs
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --log-level debug
     healthcheck:

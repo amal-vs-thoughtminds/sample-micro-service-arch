@@ -1,46 +1,53 @@
 FROM python:3.11-slim
 
-# Set environment variables
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
-ENV PYTHONPATH=/app
-
-# Set work directory
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-        gcc \
-        g++ \
-        libpq-dev \
+# Use a different mirror and add retry logic for apt-get
+RUN echo 'Acquire::Retries "3";' > /etc/apt/apt.conf.d/80-retries && \
+    echo 'Acquire::http::Timeout "120";' >> /etc/apt/apt.conf.d/80-retries && \
+    echo 'Acquire::https::Timeout "120";' >> /etc/apt/apt.conf.d/80-retries && \
+    sed -i 's/deb.debian.org/mirrors.ustc.edu.cn/g' /etc/apt/sources.list && \
+    apt-get clean && \
+    apt-get update --allow-releaseinfo-change || \
+    (sleep 2 && apt-get update --allow-releaseinfo-change) || \
+    (sleep 5 && apt-get update --allow-releaseinfo-change)
+
+# Install system dependencies with retry logic
+RUN apt-get install -y --no-install-recommends \
         curl \
+        build-essential \
+        git \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements first (for better caching)
-COPY requirements.txt .
+# Copy shared library files
+COPY shared/setup.py ./shared/setup.py
+COPY shared/README.md ./shared/README.md
+COPY shared/ms_communicator ./shared/ms_communicator
 
-# Install Python dependencies
-RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir -r requirements.txt
+# Install shared library
+RUN pip install --no-cache-dir -e ./shared[dev]
 
-# Copy project
-COPY . .
+# Copy service files
+COPY analytics/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Create non-root user
-RUN adduser --disabled-password --gecos '' appuser \
-    && chown -R appuser:appuser /app
-USER appuser
+COPY analytics/app ./app
+COPY analytics/alembic.ini .
+COPY analytics/alembic ./alembic
+
+# Create logs directory
+RUN mkdir -p /app/logs
+
+# Set environment variables
+ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
 
 # Expose port
 EXPOSE 8000
 
 # Health check
-HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
-# Create logs directory
-RUN mkdir -p logs
-
-# Command to run the application  
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"] 
+# Run the application
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"] 

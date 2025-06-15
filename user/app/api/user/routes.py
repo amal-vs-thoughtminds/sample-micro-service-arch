@@ -1,24 +1,28 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from app.core.jwt_handler import get_current_user, create_access_token
+from fastapi import APIRouter, Depends, HTTPException, status, Request
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
 from typing import Dict, Any, Optional
+from datetime import datetime, timedelta
 
 from ...core.db import get_postgres_db
-from ...core.dependencies import get_decrypted_payload, get_optional_decrypted_payload
-from ...core.encryption import encrypt_response_data
-from ...core.dispatcher import dispatcher
-from ...core.jwt_handler import create_access_token
+from ...core.dependencies import get_decrypted_payload
 from ...models.user import User
-from .schemas import UserCreate, UserLogin, UserResponse, Token, APIResponse
+from .schemas import UserCreate, APIResponse, UserLogin
 from .services.create_user import create_user
-from .services.authenticate_user import authenticate_user
 from .services.get_user_stats import get_user_stats
+from .services.authenticate_user import authenticate_user
+from ms_communicator import MicroServiceClient
+import logging
 
 router = APIRouter(prefix="/users", tags=["users"])
+logger = logging.getLogger(__name__)
 
+# Initialize the microservice client
+service_client = MicroServiceClient("user-service")
 
 @router.post("/register", response_model=APIResponse)
 async def register_user(
+    request: Request,
     user_data: UserCreate,
     db: AsyncSession = Depends(get_postgres_db),
     decrypted_payload: Optional[Dict[str, Any]] = Depends(get_decrypted_payload)
@@ -32,7 +36,7 @@ async def register_user(
         # Create user
         new_user = await create_user(db, user_data)
         
-        # Notify analytics service via dispatcher
+        # Notify analytics service
         try:
             analytics_data = {
                 "event_type": "user_action",
@@ -40,43 +44,37 @@ async def register_user(
                 "user_id": new_user.id,
                 "properties": {"username": new_user.username}
             }
-            analytics_response = await dispatcher.call_analytics_service(
-                "/api/v1/analytics/events", 
-                analytics_data
+            
+            await service_client.request(
+                target_service="analytics-service",
+                endpoint="/api/v1/analytics/events",
+                method="POST",
+                payload=analytics_data
             )
+            logger.info(f"Analytics event sent for user registration: {new_user.id}")
         except Exception as e:
             # Analytics notification failed, but user creation succeeded
-            pass
+            logger.error(f"Failed to send analytics event: {str(e)}")
         
-        response_data = {
-            "message": "User created successfully",
-            "data": {"user_id": new_user.id, "username": new_user.username}
-        }
-        
-        # Return encrypted response for service communication
-        if decrypted_payload:
-            return encrypt_response_data(response_data)
-        
-        return APIResponse(**response_data)
+        return APIResponse(
+            message="User created successfully",
+            data={"user_id": new_user.id, "username": new_user.username}
+        )
     
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except Exception as e:
+        logger.error(f"User registration failed: {str(e)}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal server error")
 
-
-@router.post("/login")
-async def login_user(
+@router.post("/login", response_model=APIResponse)
+async def user_login(
     login_data: UserLogin,
-    db: AsyncSession = Depends(get_postgres_db),
-    decrypted_payload: Optional[Dict[str, Any]] = Depends(get_optional_decrypted_payload)
+    request: Request,
+    db: AsyncSession = Depends(get_postgres_db)
 ):
-    """Login user and track login event via dispatcher (optional encryption)"""
+    """Handle user login, generate JWT token, and send analytics"""
     try:
-        # Use decrypted payload if available
-        if decrypted_payload:
-            login_data = UserLogin(**decrypted_payload)
-        
         # Authenticate user
         user = await authenticate_user(db, login_data.username, login_data.password)
         if not user:
@@ -84,90 +82,94 @@ async def login_user(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Incorrect username or password"
             )
-        
-        # Create access token
-        access_token = create_access_token(data={"sub": user.username, "user_id": user.id})
-        
-        # Track login event via dispatcher
+
+        # Generate JWT token
+        token_data = {
+            "sub": str(user.id),
+            "username": user.username,
+            "exp": datetime.utcnow() + timedelta(days=1)  # Token expires in 1 day
+        }
+        access_token = create_access_token(token_data)
+
+        # Send analytics about the login
         try:
-            analytics_data = {
-                "event_type": "user_action",
-                "event_name": "user_login",
-                "user_id": user.id,
-                "properties": {"login_method": "password"}
-            }
-            await dispatcher.call_analytics_service(
-                "/api/v1/analytics/events",
-                analytics_data
+            analytics_response = await service_client.request(
+                target_service="analytics-service",
+                endpoint="/api/v1/analytics/track",
+                method="POST",
+                payload={
+                    "user_id": str(user.id),
+                    "action": "login",
+                    "metadata": {
+                        "ip_address": request.client.host if request.client else "unknown",
+                        "user_agent": request.headers.get("user-agent", "unknown"),
+                        "timestamp": datetime.utcnow().isoformat()
+                    }
+                }
             )
+            analytics_tracked = analytics_response.get("status") == "success"
         except Exception as e:
-            # Analytics tracking failed, but login succeeded
-            pass
-        
-        token_data = {"access_token": access_token, "token_type": "bearer"}
-        
-        # Return encrypted response only if originally encrypted or specifically requested
-        if decrypted_payload:
-            return encrypt_response_data(token_data)
-        
-        return Token(**token_data)
-    
+            logger.error(f"Failed to send analytics event: {str(e)}")
+            analytics_tracked = False
+
+        return APIResponse(
+            message="Login successful",
+            data={
+                "access_token": access_token,
+                "token_type": "bearer",
+                "user_id": user.id,
+                "username": user.username,
+                "analytics_tracked": analytics_tracked
+            }
+        )
+
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal server error")
+        logger.error(f"Login failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
+@router.get("/{user_id}/analytics")
+async def get_user_analytics(
+    user_id: str,
+    request: Request,
+    current_user: User = Depends(get_current_user)
+):
+    """Get analytics data for a user"""
+    try:
+        # Get analytics data
+        analytics_response = await service_client.request(
+            target_service="analytics-service",
+            endpoint=f"/api/v1/analytics/user/{user_id}",
+            method="GET"
+        )
+        
+        return {
+            "status": "success",
+            "user_id": user_id,
+            "analytics": analytics_response
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to get analytics: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/stats/count", response_model=APIResponse)
 async def get_user_count(
-    db: AsyncSession = Depends(get_postgres_db)
+    request: Request,
+    db: AsyncSession = Depends(get_postgres_db),
+    decrypted_payload: Optional[Dict[str, Any]] = Depends(get_decrypted_payload)
 ):
-    """Get total user count - called by analytics service (always public, no encryption needed)"""
+    """Get total user count - called by analytics service"""
     try:
+        # Get user stats
         stats_data = await get_user_stats(db)
         
-        response_data = {
-            "message": "User statistics retrieved",
-            "data": stats_data
-        }
-        
-        return APIResponse(**response_data)
+        return APIResponse(
+            message="User statistics retrieved",
+            data=stats_data
+        )
     
     except Exception as e:
+        logger.error(f"Failed to get user count: {str(e)}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to get user count")
-
-
-@router.get("/profile")
-async def get_user_profile(
-    username: str,
-    db: AsyncSession = Depends(get_postgres_db),
-    decrypted_payload: Optional[Dict[str, Any]] = Depends(get_optional_decrypted_payload)
-):
-    """Demo endpoint showing optional encryption - can be called with or without encryption"""
-    try:
-        # Find user
-        result = await db.execute(select(User).where(User.username == username))
-        user = result.scalar_one_or_none()
-        if not user:
-            raise HTTPException(status_code=404, detail="User not found")
-        
-        profile_data = {
-            "message": "User profile retrieved",
-            "data": {
-                "username": user.username,
-                "email": user.email,
-                "is_active": user.is_active,
-                "created_at": user.created_at.isoformat()
-            }
-        }
-        
-        # Return encrypted response only if client requested encryption
-        if decrypted_payload:
-            return encrypt_response_data(profile_data)
-        
-        return APIResponse(**profile_data)
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to get profile") 

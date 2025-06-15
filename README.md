@@ -306,3 +306,14 @@ response = requests.post(url, headers=headers, json=data)
 - **Retry Logic**: Automatic recovery from transient failures
 
 This architecture provides a robust, scalable, and maintainable foundation for microservices development with modern Python async patterns. 
+
+### Encrypted Communication Flow
+
+User Service               Analytics Service
+   |                           |
+   |-- Encrypted Request -->   |
+   |   (using USER_KEY)        |-- Decrypts using get_decrypted_payload
+   |                           |-- Processes request
+   |                           |-- Encrypts response using get_encryption_manager
+   |<-- Encrypted Response --  |
+   |   (using ANALYTICS_KEY)   |

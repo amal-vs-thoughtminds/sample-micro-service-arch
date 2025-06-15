@@ -1,61 +1,86 @@
 from fastapi import Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, AsyncGenerator, Annotated
 import json
 import logging
-
+from ms_communicator.utils.encryption import EncryptionManager, EncryptionError
 from .db import get_postgres_db
-from .mongodb import get_mongodb, get_mongo_collection
-from .encryption import decrypt_request_data
+from .mongodb import get_mongo_collection
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
+# Initialize encryption manager with service-specific key
+encryption_manager = EncryptionManager(settings.ENCRYPTION_KEY)
 
-async def get_decrypted_payload(request: Request) -> Optional[Dict[str, Any]]:
-    """
-    Dependency to automatically decrypt request payload if it's encrypted.
-    Returns None if not encrypted, or the decrypted data if encrypted.
-    """
-    if request.headers.get("X-Service-Communication") == "encrypted":
-        try:
-            body = await request.json()
-            if "encrypted_data" in body:
-                return decrypt_request_data(body["encrypted_data"])
-        except Exception as e:
-            logger.error(f"Failed to decrypt request: {e}")
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Failed to decrypt request data"
-            )
-    return None
+# Database dependencies
+PostgresDB = Annotated[AsyncSession, Depends(get_postgres_db)]
+MongoDB = Annotated[AsyncGenerator, Depends(get_mongo_collection)]
 
+# Encryption manager dependency
+def get_encryption_manager() -> EncryptionManager:
+    """Get encryption manager instance"""
+    try:
+        return EncryptionManager(
+            service_name=settings.SERVICE_NAME,
+            encryption_key=settings.ANALYTICS_SERVICE_ENCRYPTION_KEY
+        )
+    except Exception as e:
+        logger.error(f"Failed to initialize encryption manager: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to initialize encryption service"
+        )
+
+# Decrypted payload dependency
+async def get_decrypted_payload(
+    encrypted_payload: str,
+    encryption_manager: Annotated[EncryptionManager, Depends(get_encryption_manager)]
+) -> dict:
+    """Decrypt and validate payload"""
+    try:
+        return await encryption_manager.decrypt_payload(encrypted_payload)
+    except EncryptionError as e:
+        logger.error(f"Decryption error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+    except Exception as e:
+        logger.error(f"Unexpected error during decryption: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to process encrypted payload"
+        )
 
 async def get_optional_decrypted_payload(request: Request) -> Optional[Dict[str, Any]]:
-    """
-    Optional dependency for endpoints that may or may not need encryption.
-    Only decrypts if X-Encrypt-Response header is present or service communication.
-    """
-    # Only decrypt if client specifically requests encrypted communication
-    if (request.headers.get("X-Encrypt-Response") == "true" or 
-        request.headers.get("X-Service-Communication") == "encrypted"):
-        try:
-            return await get_decrypted_payload(request)
-        except:
-            # If decryption fails, just return None (handle as regular request)
+    """Get and decrypt the request payload if it exists"""
+    try:
+        if not request.headers.get('content-type') == 'application/json':
             return None
-    
-    return None
+            
+        encrypted_data = await request.json()
+        
+        if not isinstance(encrypted_data, dict) or 'encrypted_data' not in encrypted_data:
+            return None
+            
+        decrypted_data = encryption_manager.decrypt_payload(encrypted_data['encrypted_data'])
+        return decrypted_data
+    except EncryptionError as e:
+        logger.error(f"Decryption error: {str(e)}")
+        return None
+    except Exception as e:
+        logger.error(f"Error processing encrypted payload: {str(e)}")
+        return None
 
-
-def get_db_session() -> AsyncSession:
-    """Get database session dependency"""
-    return Depends(get_postgres_db)
-
+async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
+    """Get database session"""
+    async for session in get_postgres_db():
+        yield session
 
 async def get_mongo_db():
     """Get MongoDB dependency"""
     return await get_mongodb()
-
 
 async def get_mongo_db_collection(collection_name: str):
     """Get MongoDB collection dependency"""

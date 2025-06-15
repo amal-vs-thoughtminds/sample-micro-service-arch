@@ -1,43 +1,59 @@
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
-from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+from sqlalchemy.orm import declarative_base
+from sqlalchemy.pool import NullPool
 from typing import AsyncGenerator
-
+import logging
 from .config import settings
-from .mongodb import mongo_instance
 
-# Async SQLAlchemy setup
+logger = logging.getLogger(__name__)
+
+# Create async engine
 engine = create_async_engine(
-    settings.postgres_url.replace("postgresql://", "postgresql+asyncpg://"),
-    pool_pre_ping=True,
-    pool_recycle=300,
-    echo=settings.debug
+    f"postgresql+asyncpg://{settings.POSTGRES_USER}:{settings.POSTGRES_PASSWORD}@{settings.POSTGRES_HOST}:{settings.POSTGRES_PORT}/{settings.POSTGRES_DB}",
+    echo=settings.DEBUG,
+    poolclass=NullPool  # Disable connection pooling for ASGI
 )
 
-AsyncSessionLocal = async_sessionmaker(
-    engine, 
-    class_=AsyncSession, 
-    expire_on_commit=False
+# Create async session factory
+async_session_factory = async_sessionmaker(
+    engine,
+    class_=AsyncSession,
+    expire_on_commit=False,
+    autocommit=False,
+    autoflush=False
 )
 
+# Create declarative base
 Base = declarative_base()
 
-
 async def get_postgres_db() -> AsyncGenerator[AsyncSession, None]:
-    """Get PostgreSQL async database session"""
-    async with AsyncSessionLocal() as session:
+    """FastAPI dependency for getting async database session"""
+    async with async_session_factory() as session:
         try:
             yield session
+            await session.commit()
+        except Exception as e:
+            await session.rollback()
+            logger.error(f"Database session error: {str(e)}")
+            raise
         finally:
             await session.close()
 
-
 async def create_tables():
-    """Create all PostgreSQL tables"""
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
+    """Create database tables"""
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        logger.info("Database tables created successfully")
+    except Exception as e:
+        logger.error(f"Failed to create database tables: {str(e)}")
+        raise
 
 async def close_db_connections():
-    """Close all database connections"""
-    await engine.dispose()
-    await mongo_instance.close_connections() 
+    """Close database connections"""
+    try:
+        await engine.dispose()
+        logger.info("Database connections closed")
+    except Exception as e:
+        logger.error(f"Error closing database connections: {str(e)}")
+        raise 

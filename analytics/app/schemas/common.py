@@ -1,13 +1,21 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, Any, Dict
 from datetime import datetime
 
 
 class HealthCheck(BaseModel):
-    status: str = "healthy"
-    service: str
-    version: str
-    timestamp: str
+    """Health check response model"""
+    status: str = Field(..., description="Service health status")
+    version: str = Field(..., description="Service version")
+    timestamp: datetime = Field(default_factory=datetime.utcnow, description="UTC timestamp of the health check")
+    service: str = Field(..., description="Service name")
+    details: Optional[dict] = Field(default=None, description="Additional health check details")
+
+    class Config:
+        json_encoders = {
+            datetime: lambda v: v.isoformat()
+        }
+        from_attributes = True
 
 
 class APIResponse(BaseModel):

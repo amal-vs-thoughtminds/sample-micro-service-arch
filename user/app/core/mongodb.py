@@ -1,102 +1,122 @@
-from motor.motor_asyncio import AsyncIOMotorClient
+from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 from typing import Optional
 import logging
-
 from .config import settings
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
 
 logger = logging.getLogger(__name__)
 
-
-class MongoInstance:
-    """MongoDB instance for managing async database connections"""
-    
-    _instance = None
+class MongoDBInstance:
+    """ASGI-compatible MongoDB singleton instance"""
+    _instance: Optional['MongoDBInstance'] = None
     _client: Optional[AsyncIOMotorClient] = None
-    _db = None
-    _initialized = False
+    _db: Optional[AsyncIOMotorDatabase] = None
+    _initialized: bool = False
     
     def __new__(cls):
         if cls._instance is None:
-            cls._instance = super(MongoInstance, cls).__new__(cls)
+            cls._instance = super().__new__(cls)
         return cls._instance
     
-    async def initialize(self):
-        """Initialize MongoDB async connection"""
-        if not self._initialized:
-            try:
-                self._client = AsyncIOMotorClient(settings.mongodb_url)
-                self._db = self._client[settings.mongodb_db]
-                
-                # Test the connection
-                await self._client.admin.command('ping')
-                self._initialized = True
-                logger.info(f"MongoDB async client initialized - Database: {settings.mongodb_db}")
-                
-            except Exception as e:
-                logger.error(f"Failed to initialize MongoDB: {e}")
-                raise
-    
-    async def get_database(self):
-        """Get asynchronous MongoDB database"""
-        if not self._initialized:
-            await self.initialize()
-        return self._db
-    
-    async def get_collection(self, collection_name: str):
-        """Get a specific collection from the database"""
-        db = await self.get_database()
-        return db[collection_name]
-    
-    async def close_connections(self):
-        """Close MongoDB connections"""
-        if self._client and self._initialized:
-            await self._client.close()
-            self._initialized = False
-            logger.info("MongoDB async client closed")
-    
-    async def ping(self) -> bool:
-        """Test MongoDB connection"""
+    async def initialize(self) -> None:
+        """Initialize MongoDB connection"""
+        if self._initialized:
+            return
+            
         try:
-            if self._client:
-                await self._client.admin.command('ping')
-                return True
-            return False
+            # Create MongoDB connection URL
+            mongo_url = f"mongodb://{settings.MONGODB_USER}:{settings.MONGODB_PASSWORD}@{settings.MONGODB_HOST}:{settings.MONGODB_PORT}"
+            
+            # Initialize client
+            self._client = AsyncIOMotorClient(mongo_url)
+            
+            # Get database
+            self._db = self._client[settings.MONGODB_DB]
+            
+            # Verify connection
+            await self._client.admin.command('ping')
+            logger.info("Successfully connected to MongoDB")
+            
+            # Create indexes
+            await self.create_indexes()
+            
+            self._initialized = True
+            logger.info("MongoDB initialized successfully")
+            
         except Exception as e:
-            logger.error(f"MongoDB ping failed: {e}")
-            return False
+            logger.error(f"Failed to initialize MongoDB: {str(e)}")
+            raise
     
-    async def create_indexes(self):
-        """Create database indexes for better performance"""
+    async def create_indexes(self) -> None:
+        """Create necessary indexes for the user collection"""
         try:
-            db = await self.get_database()
+            collection = self._db[settings.MONGODB_COLLECTION]
             
-            # User activities collection indexes
-            user_activities = db.user_activities
-            await user_activities.create_index("user_id")
-            await user_activities.create_index("timestamp")
-            await user_activities.create_index([("user_id", 1), ("timestamp", -1)])
-            
-            # User sessions collection indexes
-            user_sessions = db.user_sessions
-            await user_sessions.create_index("user_id")
-            await user_sessions.create_index("session_id")
-            await user_sessions.create_index("created_at")
+            # Create indexes
+            await collection.create_index("user_id", unique=True)
+            await collection.create_index("email", unique=True)
+            await collection.create_index("username", unique=True)
+            await collection.create_index("created_at")
+            await collection.create_index("last_login")
             
             logger.info("MongoDB indexes created successfully")
-            
         except Exception as e:
-            logger.error(f"Failed to create MongoDB indexes: {e}")
+            logger.error(f"Failed to create MongoDB indexes: {str(e)}")
+            raise
+    
+    async def close_connections(self) -> None:
+        """Close MongoDB connections"""
+        if self._client:
+            self._client.close()
+            self._client = None
+            self._db = None
+            self._initialized = False
+            logger.info("MongoDB connections closed")
+    
+    @property
+    def db(self) -> AsyncIOMotorDatabase:
+        """Get database instance"""
+        if not self._initialized:
+            raise RuntimeError("MongoDB not initialized. Call initialize() first.")
+        return self._db
+    
+    @property
+    def client(self) -> AsyncIOMotorClient:
+        """Get client instance"""
+        if not self._initialized:
+            raise RuntimeError("MongoDB not initialized. Call initialize() first.")
+        return self._client
 
+# Create global MongoDB instance
+mongo_instance = MongoDBInstance()
 
-# Global MongoDB instance
-mongo_instance = MongoInstance()
+# ASGI lifespan handler
+@asynccontextmanager
+async def mongodb_lifespan(app: FastAPI):
+    """MongoDB lifespan handler for ASGI applications"""
+    try:
+        # Initialize MongoDB on startup
+        await mongo_instance.initialize()
+        yield
+    finally:
+        # Close MongoDB connections on shutdown
+        await mongo_instance.close_connections()
 
-
+# Dependency for getting MongoDB collection
 async def get_mongodb():
-    """Get MongoDB database (asynchronous dependency)"""
-    return await mongo_instance.get_database()
+    """FastAPI dependency for getting MongoDB database"""
+    if not mongo_instance._initialized:
+        await mongo_instance.initialize()
+    return mongo_instance.db
 
-
-async def get_mongo_collection(collection_name: str):
-    """Get specific MongoDB collection (asynchronous)"""
-    return await mongo_instance.get_collection(collection_name) 
+async def get_mongo_collection(collection_name: str | None = None):
+    """FastAPI dependency for getting MongoDB collection"""
+    if not mongo_instance._initialized:
+        await mongo_instance.initialize()
+    
+    # Use default collection if none provided
+    if collection_name is None:
+        collection_name = settings.MONGODB_COLLECTION
+        
+    return mongo_instance.db[collection_name] 
